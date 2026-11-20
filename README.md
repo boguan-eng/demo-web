@@ -15,3 +15,5 @@ GCP values are never stored in this repo. They come from GitHub Environment
 secrets: `GCP_WIF_PROVIDER` and `GCP_AR_REPO` (both environments), plus
 `GCP_AR_REPO_SOURCE` (prod only). Authentication uses direct Workload Identity
 Federation (no service account, no keys).
+
+Images are pushed to Artifact Registry by CI (see `.github/workflows/ci.yml`).

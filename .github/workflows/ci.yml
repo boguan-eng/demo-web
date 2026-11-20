@@ -1,0 +1,151 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      images: ${{ steps.list.outputs.images }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: list
+        run: |
+          set -euo pipefail
+          images=$(for d in images/*/; do basename "$d"; done | jq -R . | jq -sc .)
+          echo "images=$images" >> "$GITHUB_OUTPUT"
+
+  build:
+    if: github.event_name == 'pull_request'
+    needs: discover
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ${{ fromJSON(needs.discover.outputs.images) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: docker build -t "$IMAGE:ci" "images/$IMAGE"
+
+  push:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: discover
+    runs-on: ubuntu-latest
+    environment: nonprod
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ${{ fromJSON(needs.discover.outputs.images) }}
+    steps:
+      - name: Mask project identifiers
+        env:
+          WIF_PROVIDER: ${{ secrets.GCP_WIF_PROVIDER }}
+          AR_REPO: ${{ secrets.GCP_AR_REPO }}
+        run: |
+          set -euo pipefail
+          project_number=$(echo "$WIF_PROVIDER" | cut -d/ -f2)
+          project_id=$(echo "$AR_REPO" | cut -d/ -f2)
+          echo "::add-mask::$project_number"
+          echo "::add-mask::$project_id"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+      - name: Configure Docker for Artifact Registry
+        env:
+          AR: ${{ secrets.GCP_AR_REPO }}
+        run: |
+          set -euo pipefail
+          gcloud auth configure-docker "$(echo "$AR" | cut -d/ -f1)" --quiet
+      - name: Build and push
+        env:
+          AR: ${{ secrets.GCP_AR_REPO }}
+          IMAGE: ${{ matrix.image }}
+        run: |
+          set -euo pipefail
+          docker build -t "$AR/$IMAGE:$GITHUB_SHA" "images/$IMAGE"
+          docker push "$AR/$IMAGE:$GITHUB_SHA"
+
+  promote:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: discover
+    runs-on: ubuntu-latest
+    environment: prod
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ${{ fromJSON(needs.discover.outputs.images) }}
+    steps:
+      - name: Mask project identifiers
+        env:
+          WIF_PROVIDER: ${{ secrets.GCP_WIF_PROVIDER }}
+          AR_REPO: ${{ secrets.GCP_AR_REPO }}
+          AR_REPO_SOURCE: ${{ secrets.GCP_AR_REPO_SOURCE }}
+        run: |
+          set -euo pipefail
+          project_number=$(echo "$WIF_PROVIDER" | cut -d/ -f2)
+          project_id=$(echo "$AR_REPO" | cut -d/ -f2)
+          source_project_id=$(echo "$AR_REPO_SOURCE" | cut -d/ -f2)
+          echo "::add-mask::$project_number"
+          echo "::add-mask::$project_id"
+          echo "::add-mask::$source_project_id"
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+      - name: Configure Docker for Artifact Registry
+        env:
+          AR: ${{ secrets.GCP_AR_REPO }}
+          SRC: ${{ secrets.GCP_AR_REPO_SOURCE }}
+        run: |
+          set -euo pipefail
+          gcloud auth configure-docker "$(echo "$AR" | cut -d/ -f1),$(echo "$SRC" | cut -d/ -f1)" --quiet
+      - name: Install crane (pinned, checksum verified)
+        env:
+          CRANE_VERSION: v0.22.1
+          CRANE_SHA256: 0ab7a1d6932a213aed964ce97666c3077fe691c8606413674a8b3e0b9ec4cda0
+        run: |
+          set -euo pipefail
+          f=go-containerregistry_Linux_x86_64.tar.gz
+          curl -fsSL -o "$RUNNER_TEMP/$f" \
+            "https://github.com/google/go-containerregistry/releases/download/$CRANE_VERSION/$f"
+          echo "$CRANE_SHA256  $RUNNER_TEMP/$f" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/crane-bin"
+          tar -xzf "$RUNNER_TEMP/$f" -C "$RUNNER_TEMP/crane-bin" crane
+          echo "$RUNNER_TEMP/crane-bin" >> "$GITHUB_PATH"
+      - name: Promote by digest
+        env:
+          AR: ${{ secrets.GCP_AR_REPO }}
+          SRC: ${{ secrets.GCP_AR_REPO_SOURCE }}
+          IMAGE: ${{ matrix.image }}
+        run: |
+          set -euo pipefail
+          DIGEST=$(crane digest "$SRC/$IMAGE:$GITHUB_SHA")
+          if [ -z "$DIGEST" ]; then
+            echo "no source image found for $IMAGE at $GITHUB_SHA" >&2
+            exit 1
+          fi
+          crane copy "$SRC/$IMAGE@$DIGEST" "$AR/$IMAGE:$GITHUB_REF_NAME"
